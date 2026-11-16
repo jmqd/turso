@@ -1,0 +1,29 @@
+[package]
+name = "turso-db-creation"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Database creation throughput, concurrency, RSS, and FD benchmark"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "db-creation"
+path = "main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+memory-stats = "1.2.0"
+mimalloc = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+turso_core = { workspace = true }
+turso_pg = { workspace = true }
+turso_sqlite = { workspace = true }
