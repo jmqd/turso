@@ -348,3 +348,63 @@ fn wasm_opfs_cache_spill_insert_hang() {
         }
     }
 }
+
+#[test]
+fn open_async_reopens_wal_and_mvcc_databases_without_internal_step() {
+    for enable_mvcc in [false, true] {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io = Arc::new(StepGuardedIO::new());
+        let path = if enable_mvcc {
+            "open_async_reopen_mvcc.db"
+        } else {
+            "open_async_reopen_wal.db"
+        };
+
+        {
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                path,
+                OpenFlags::Create,
+                turso_core::DatabaseOpts::new().with_mvcc(enable_mvcc),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_items_name ON items(name)")
+                .unwrap();
+            conn.execute("INSERT INTO items VALUES (1, 'alpha'), (2, 'beta')")
+                .unwrap();
+            conn.execute("ANALYZE").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(Arc::new(turso_core::storage::database::DatabaseFile::new(
+                file,
+            )))
+            .flags(OpenFlags::Create)
+            .db_opts(turso_core::DatabaseOpts::new().with_mvcc(enable_mvcc));
+        let mut state = turso_core::OpenDbAsyncState::new();
+        let (reopened, open_yields) = drive_guarded_io(io.as_ref(), || {
+            Database::open_async(&mut state, io.clone(), path, &options)
+        });
+
+        assert!(
+            open_yields > 0,
+            "open_async must yield through the caller's IO loop when reopening {path}"
+        );
+        let conn = reopened
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        assert!(conn
+            .current_schema()
+            .get_btree_table(turso_core::NamespaceId::ROOT, "items")
+            .is_some());
+    }
+}

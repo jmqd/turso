@@ -7088,6 +7088,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-db-creation"
+version = "0.9.0-pre.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "memory-stats",
+ "mimalloc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "turso_core",
+ "turso_pg",
+ "turso_sqlite",
+]
+
+[[package]]
 name = "turso-dbhash"
 version = "0.9.0-pre.5"
 dependencies = [

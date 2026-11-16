@@ -182,5 +182,10 @@ harness = false
 name = "string_expr_benchmark"
 path = "string_expr_benchmark.rs"
 harness = false
+
+[[bench]]
+name = "open_benchmark"
+path = "open_benchmark.rs"
+harness = false
 [lints]
 workspace = true
