@@ -477,9 +477,8 @@ impl Default for HeaderValidationState {
 /// - `Blocking`: the caller may block, so `_connect` runs the scan to
 ///   completion right here by pumping `io.step()`. This is the public
 ///   `connect` family for embedded users, where whatever the scan waits for
-///   can make progress on its own, and the internal open-time and MVCC
-///   bootstrap connections, for which the refresh is a no-op because the
-///   database is not initialized yet.
+///   can make progress on its own, and the MVCC bootstrap connection of
+///   `reload_wal_after_external_restore`, which is itself synchronous.
 /// - `Deferred`: the caller must not block, so `_connect` returns the bare
 ///   connection and the caller drives the same scan through
 ///   `refresh_analyze_stats_nonblock`, handing every wait to its own
@@ -553,7 +552,7 @@ pub struct OpenDbAsyncState {
     phase: OpenDbAsyncPhase,
     db: Option<Arc<Database>>,
     pager: Option<Arc<Pager>>,
-    conn: Option<Arc<Connection>>,
+    default_cache_size: i32,
     encryption_key: Option<EncryptionKey>,
     make_from_btree_state: schema::MakeFromBtreeState,
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
@@ -581,6 +580,7 @@ pub struct OpenDbAsyncState {
     dialect_schema_stmt: Option<Box<Statement>>,
     dialect_schema_rows: Vec<Vec<Value>>,
     dialect_schema_results: Vec<Vec<Vec<Value>>>,
+    dialect_schema_conn: Option<Arc<Connection>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -595,7 +595,7 @@ impl OpenDbAsyncState {
             phase: OpenDbAsyncPhase::Init,
             db: None,
             pager: None,
-            conn: None,
+            default_cache_size: 0,
             encryption_key: None,
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
@@ -609,6 +609,7 @@ impl OpenDbAsyncState {
             dialect_schema_stmt: None,
             dialect_schema_rows: Vec::new(),
             dialect_schema_results: Vec::new(),
+            dialect_schema_conn: None,
         }
     }
 }
@@ -1639,7 +1640,7 @@ impl Database {
                     state.header_validation_state = hv_state;
                     let pager = return_if_io!(result);
 
-                    let mut db = state
+                    let db = state
                         .building_db
                         .take()
                         .expect("building_db must be set in Init phase");
@@ -1654,23 +1655,8 @@ impl Database {
                             "Either WAL or MVStore must be enabled"
                         );
                     }
-                    let _ = &mut db;
 
-                    // Wrap db in Arc before connecting
                     let db = Arc::new(db);
-
-                    // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
-                    let conn = db._connect(
-                        ConnectOpts {
-                            role: SessionRole::Superuser,
-                            encryption_key: state.encryption_key.clone(),
-                            page_codec: page_codec.clone(),
-                        },
-                        ConnectionContext::default(),
-                        false,
-                        Some(pager.clone()),
-                        StatsRefresh::Blocking,
-                    )?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
                     // to ensure schema_version and make_from_btree are atomic
@@ -1678,7 +1664,6 @@ impl Database {
 
                     state.db = Some(db);
                     state.pager = Some(pager);
-                    state.conn = Some(conn);
                     state.schema_guard = Some(guard);
 
                     state.phase = OpenDbAsyncPhase::ReadingHeader;
@@ -1688,55 +1673,51 @@ impl Database {
                     let pager = state
                         .pager
                         .as_ref()
-                        .expect("pager must be initialized in Init phase");
-                    let header_schema_cookie =
-                        return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
+                        .expect("pager must be initialized in ValidatingHeader phase");
+                    let (header_schema_cookie, default_cache_size) = return_if_io!(pager
+                        .with_header(|header| {
+                            (
+                                header.schema_cookie.get(),
+                                header.default_page_cache_size.get(),
+                            )
+                        }));
                     let guard = state
                         .schema_guard
                         .as_mut()
-                        .expect("schema_guard must be acquired in Init phase");
-                    // We logically exclusively own schema via the Opening sentinel in the
-                    // registry which prevents concurrent opens of the same path.
-                    // At this point we already created a connection which cloned the schema
-                    // internally, so we can't use get_mut here.
-                    //
-                    // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
-                    let schema = Schema::try_make_mut(guard)?;
+                        .expect("schema_guard must be acquired in ValidatingHeader phase");
+                    let schema = Arc::get_mut(guard)
+                        .expect("open-time schema must be uniquely owned while loading");
                     schema.schema_version = header_schema_cookie;
+                    state.default_cache_size = default_cache_size;
 
                     state.phase = OpenDbAsyncPhase::LoadingSchema;
                 }
 
                 OpenDbAsyncPhase::LoadingSchema => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in ValidatingHeader phase");
                     let pager = state
                         .pager
                         .as_ref()
-                        .expect("pager must be initialized in Init phase");
-                    let conn = state
-                        .conn
-                        .as_ref()
-                        .expect("conn must be initialized in Init phase");
-                    let syms = conn.syms.read();
+                        .expect("pager must be initialized in ValidatingHeader phase");
+                    let syms = db.builtin_syms.read();
 
                     let guard = state
                         .schema_guard
                         .as_mut()
-                        .expect("schema_guard must be acquired in Init phase");
-                    // while we logically exclusively own schema as we hold DATABASE_MANAGER lock in the top level `open_async` function
-                    // at the moment we already created connection which cloned the schema internally
-                    // so, we can't use get_mut here for now
-                    //
-                    // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
-                    let schema = Schema::try_make_mut(guard)?;
+                        .expect("schema_guard must be acquired in ValidatingHeader phase");
+                    let schema = Arc::get_mut(guard)
+                        .expect("open-time schema must be uniquely owned while loading");
 
-                    let dialect = conn.dialect();
                     let result = schema.make_from_btree(
                         &mut state.make_from_btree_state,
                         None,
                         pager,
                         &syms,
-                        dialect.as_ref(),
-                        conn.experimental_custom_types_enabled(),
+                        db.dialect.as_ref(),
+                        db.experimental_custom_types_enabled(),
                     );
 
                     match result {
@@ -1755,11 +1736,7 @@ impl Database {
                     let db = state
                         .db
                         .as_ref()
-                        .expect("db must be initialized in Init phase");
-                    let pager = state
-                        .pager
-                        .as_ref()
-                        .expect("pager must be initialized in Init phase");
+                        .expect("db must be initialized in ValidatingHeader phase");
 
                     // DatabaseOpts::with_mvcc on a database that is not in MVCC
                     // mode yet: switch the journal mode as part of the open. A
@@ -1775,10 +1752,7 @@ impl Database {
                             && !db.open_flags.contains(OpenFlags::ReadOnly))
                     {
                         if state.mvcc_convert_stmt.is_none() {
-                            let conn = state
-                                .conn
-                                .as_ref()
-                                .expect("conn must be initialized in Init phase");
+                            let conn = Self::open_connection(state)?;
                             state.mvcc_convert_stmt =
                                 Some(conn.prepare("PRAGMA journal_mode = 'mvcc'")?);
                         }
@@ -1790,17 +1764,8 @@ impl Database {
                         // hold it across yields. Re-entry reuses the existing
                         // connection and the persisted `BootstrapState`.
                         if state.mvcc_bootstrap_conn.is_none() {
-                            state.mvcc_bootstrap_conn = Some(db._connect(
-                                ConnectOpts {
-                                    role: SessionRole::Superuser,
-                                    encryption_key: state.encryption_key.clone(),
-                                    page_codec: page_codec.clone(),
-                                },
-                                ConnectionContext::default(),
-                                true,
-                                Some(pager.clone()),
-                                StatsRefresh::Blocking,
-                            )?);
+                            state.mvcc_bootstrap_conn =
+                                Some(Self::mvcc_bootstrap_connection(state)?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
                         return_if_io!(
@@ -1814,15 +1779,20 @@ impl Database {
                     // of their objects do not carry. This comes after the MVCC
                     // bootstrap, whose recovery rebuilds the schema from the
                     // schema rows and may replay rows of the namespaces table.
-                    let conn = state
-                        .conn
-                        .as_ref()
-                        .expect("conn must be initialized in Init phase");
-                    conn.maybe_update_schema();
-                    if !conn
-                        .with_schema(crate::MAIN_DB_ID, |schema| schema.namespace_names_loaded())
-                    {
-                        let namespace_rows = conn.query_stored_namespaces()?;
+                    let (namespace_names_loaded, has_namespaces_table) = {
+                        let schema = db.schema.lock();
+                        (
+                            schema.namespace_names_loaded(),
+                            schema
+                                .has_table(NamespaceId::ROOT, schema::TURSO_NAMESPACES_TABLE_NAME),
+                        )
+                    };
+                    if !namespace_names_loaded {
+                        let namespace_rows = if has_namespaces_table {
+                            Self::open_connection(state)?.query_stored_namespaces()?
+                        } else {
+                            Vec::new()
+                        };
                         db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
                     }
 
@@ -1833,15 +1803,15 @@ impl Database {
                     let db = state
                         .db
                         .as_ref()
-                        .expect("db must be initialized in Init phase");
-                    let conn = state
-                        .conn
-                        .as_ref()
-                        .expect("conn must be initialized in Init phase");
+                        .expect("db must be initialized in ValidatingHeader phase");
                     if state.dialect_schema_queries.is_none() {
-                        let schema = db.schema.lock().clone();
-                        let queries = db.dialect().schema_state_queries(&schema);
-                        *conn.schema.write() = schema;
+                        let queries = {
+                            let schema = db.schema.lock();
+                            db.dialect().schema_state_queries(&schema)
+                        };
+                        if !queries.is_empty() {
+                            state.dialect_schema_conn = Some(Self::open_connection(state)?);
+                        }
                         state.dialect_schema_queries = Some(queries.into());
                     }
                     loop {
@@ -1853,6 +1823,10 @@ impl Database {
                             let Some(sql) = queries.pop_front() else {
                                 break;
                             };
+                            let conn = state
+                                .dialect_schema_conn
+                                .as_ref()
+                                .expect("dialect_schema_conn must exist for non-empty queries");
                             state.dialect_schema_stmt =
                                 Some(Box::new(conn.prepare_engine_metadata_read(&sql)?));
                         }
@@ -1869,6 +1843,7 @@ impl Database {
                         let rows = std::mem::take(&mut state.dialect_schema_rows);
                         state.dialect_schema_results.push(rows);
                     }
+                    state.dialect_schema_conn = None;
                     if !state.dialect_schema_results.is_empty() {
                         db.with_schema_mut(|schema| {
                             schema.dialect_schema = Some(
@@ -1884,7 +1859,7 @@ impl Database {
                         state
                             .db
                             .take()
-                            .expect("db must be initialized in Init phase"),
+                            .expect("db must be initialized in ValidatingHeader phase"),
                     ));
                 }
 
@@ -2535,7 +2510,6 @@ impl Database {
                 ConnectOpts::new(SessionRole::Superuser),
                 ConnectionContext::default(),
                 true,
-                None,
                 StatsRefresh::Blocking,
             )?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
@@ -2596,7 +2570,7 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
-        self._connect(opts, context, false, None, StatsRefresh::Blocking)
+        self._connect(opts, context, false, StatsRefresh::Blocking)
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2633,7 +2607,6 @@ impl Database {
                     opts,
                     ConnectionContext::default(),
                     false,
-                    None,
                     StatsRefresh::Deferred,
                 )?;
                 state.conn = Some(conn.clone());
@@ -2657,7 +2630,6 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
         is_mvcc_bootstrap_connection: bool,
-        pager: Option<Arc<Pager>>,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         let role = self.resolve_session_role(&opts.role)?;
@@ -2679,13 +2651,9 @@ impl Database {
         if let Some(page_codec) = page_codec.as_deref() {
             self.validate_page_codec(Some(page_codec))?;
         }
-        let pager = if let Some(pager) = pager {
-            pager
-        } else {
-            // Pass encryption key to _init so it can set up encryption context
-            // before reading page 1. This is required for reopening encrypted databases.
-            Arc::new(self._init(encryption_key.as_ref(), page_codec.clone())?)
-        };
+        // Pass encryption key to _init so it can set up encryption context
+        // before reading page 1. This is required for reopening encrypted databases.
+        let pager = Arc::new(self._init(encryption_key.as_ref(), page_codec)?);
         let default_cache_size = pager
             .io
             .block(|| pager.with_header(|header| header.default_page_cache_size))
@@ -2741,6 +2709,39 @@ impl Database {
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
+    }
+
+    fn open_connection(state: &OpenDbAsyncState) -> Result<Arc<Connection>> {
+        Self::build_open_connection(state, false)
+    }
+
+    fn mvcc_bootstrap_connection(state: &OpenDbAsyncState) -> Result<Arc<Connection>> {
+        Self::build_open_connection(state, true)
+    }
+
+    /// Build a temporary superuser connection for open-time bootstrap work.
+    /// It reuses the pager and `default_cache_size` that open already loaded
+    /// and skips the `sqlite_stat1` refresh of `_connect`, which blocks.
+    fn build_open_connection(
+        state: &OpenDbAsyncState,
+        is_mvcc_bootstrap_connection: bool,
+    ) -> Result<Arc<Connection>> {
+        let db = state
+            .db
+            .as_ref()
+            .expect("db must be initialized in ValidatingHeader phase");
+        let pager = state
+            .pager
+            .as_ref()
+            .expect("pager must be initialized in ValidatingHeader phase");
+        db.new_connection(
+            RoleId::SUPERUSER,
+            is_mvcc_bootstrap_connection,
+            pager.clone(),
+            state.encryption_key.clone(),
+            state.default_cache_size,
+            ConnectionContext::default(),
+        )
     }
 
     /// Build the `Connection` object. Does not touch the database: the
